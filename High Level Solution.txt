@@ -1,0 +1,131 @@
+High-Level Solution
+🔧 Strategy
+Active Records (< 3 months) remain in Cosmos DB.
+
+Archived Records (≥ 3 months) are moved to Azure Blob Storage as JSON or Avro files.
+
+A transparent read layer via Azure Function checks Cosmos first, then Blob if not found.
+
+Use Azure Functions Timer Trigger to run daily or weekly archival jobs.
+
+No change to existing API contracts – only the data access layer is enhanced.
+
+🏗️ Architecture Diagram
+plaintext
+Copy
+Edit
+                ┌──────────────┐
+                │ Billing API  │
+                └────┬─────────┘
+                     │
+        ┌────────────▼─────────────┐
+        │ Transparent Data Access  │
+        │  (via Azure Function)    │
+        └────┬──────────────┬──────┘
+             │              │
+   ┌─────────▼───┐   ┌──────▼───────────┐
+   │ Cosmos DB   │   │ Azure Blob       │
+   │ (< 3 mo)    │   │ (Archived JSON)  │
+   └─────────────┘   └──────────────────┘
+
+        ⬆                ▲
+   Timer-Triggered     Read fallback
+     Archiver          for old data
+⚙️ Core Components
+1. Data Archival Logic (Azure Function - Timer Trigger)
+Move data older than 3 months from Cosmos DB to Blob Storage.
+
+✅ Pseudocode:
+python
+Copy
+Edit
+import datetime
+from azure.cosmos import CosmosClient
+from azure.storage.blob import BlobServiceClient
+
+cosmos_client = CosmosClient(cosmos_uri, cosmos_key)
+container = cosmos_client.get_database_client('BillingDB').get_container_client('Records')
+
+blob_client = BlobServiceClient.from_connection_string(blob_conn_str)
+blob_container = blob_client.get_container_client("archived-records")
+
+def archive_old_billing_records():
+    cutoff_date = datetime.datetime.utcnow() - datetime.timedelta(days=90)
+    archived = []
+
+    for item in container.query_items(
+        query="SELECT * FROM c WHERE c.timestamp < @cutoff",
+        parameters=[{"name": "@cutoff", "value": cutoff_date.isoformat()}],
+        enable_cross_partition_query=True
+    ):
+        # Save to blob
+        blob_name = f"{item['id']}.json"
+        blob_container.upload_blob(blob_name, data=json.dumps(item), overwrite=True)
+
+        # Delete from Cosmos
+        container.delete_item(item, partition_key=item['partitionKey'])
+        archived.append(item['id'])
+
+    print(f"Archived {len(archived)} items.")
+2. Read Logic Layer (Azure Function / SDK Hook)
+✅ Pseudocode:
+python
+Copy
+Edit
+def get_billing_record(record_id):
+    try:
+        # Attempt to fetch from Cosmos DB
+        return container.read_item(record_id, partition_key=extract_partition_key(record_id))
+    except CosmosResourceNotFoundError:
+        # Fallback: fetch from blob
+        blob_name = f"{record_id}.json"
+        blob_data = blob_container.get_blob_client(blob_name).download_blob().readall()
+        return json.loads(blob_data)
+3. Blob Storage Schema
+Store each record as an individual JSON blob:
+
+pgsql
+Copy
+Edit
+/archived-records/
+    ├── <record-id-1>.json
+    ├── <record-id-2>.json
+Or optionally organize by month/year.
+
+📦 Benefits
+Requirement	How it’s Achieved
+Simplicity	Serverless, uses native Azure services only
+No Data Loss	Data copied to Blob before deletion
+No Downtime	Timer function runs in background
+No API Change	Read logic stays transparent to external APIs
+Latency for old records	Blob access < 2 seconds typically
+Scalability	Azure Functions and Blob scale automatically
+Cost Savings	Blob is ~90% cheaper than Cosmos DB for cold storage
+
+💸 Cost Comparison (Estimates)
+Service	Cosmos DB (~2M records)	Azure Blob Archive
+Monthly Cost	$300–$600+	~$10–$20
+Data Access	High for hot data	Cold storage, rare
+
+💡 Bonus Enhancements (Optional)
+Indexing Archive Metadata in Cosmos for fast search.
+
+Add Queue + Function retry for reliable archiving.
+
+Blob versioning and immutability policies for compliance.
+
+📁 GitHub Repo (Structure Suggestion)
+bash
+Copy
+Edit
+/azure-cost-optimization/
+│
+├── functions/
+│   ├── archive_old_records.py
+│   └── get_billing_record.py
+│
+├── deployment/
+│   └── bicep/terraform templates
+│
+├── README.md
+└── architecture.png
